@@ -1,0 +1,2 @@
+[console_scripts]
+biostat-cli = biostat_cli.cli:main

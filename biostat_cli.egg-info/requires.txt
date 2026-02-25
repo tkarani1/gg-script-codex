@@ -1,0 +1,8 @@
+polars>=1.8.0
+scipy>=1.11.0
+scikit-learn>=1.4.0
+fsspec>=2024.0.0
+gcsfs>=2024.0.0
+
+[dev]
+pytest>=8.0.0
