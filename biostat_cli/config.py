@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_THRESHOLDS = [90.0, 95.0, 98.0, 99.0]
+DEFAULT_THRESHOLDS = [0.90, 0.95, 0.98, 0.99]
 ALL_STATS = {"auc", "auprc", "enrichment", "rate_ratio"}
 
 
@@ -49,8 +49,16 @@ def parse_csv_arg(raw: str | None) -> list[str]:
 
 def parse_thresholds(raw: str | None) -> list[float]:
     if raw is None or not raw.strip():
-        return list(DEFAULT_THRESHOLDS)
-    return [float(part.strip()) for part in raw.split(",") if part.strip()]
+        thresholds = list(DEFAULT_THRESHOLDS)
+    else:
+        thresholds = [float(part.strip()) for part in raw.split(",") if part.strip()]
+
+    if any(t > 1.0 for t in thresholds):
+        raise ValueError(
+            f"Invalid threshold(s): {thresholds}. Thresholds are percentile-based fractions in [0, 1] "
+            "(e.g., 0.90 for the 90th percentile)."
+        )
+    return thresholds
 
 
 def parse_stats(raw: str) -> set[str]:
