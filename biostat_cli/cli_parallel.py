@@ -280,7 +280,7 @@ def _build_missing_variant_rows(
 
 def _run_eval_filter_combo(
     args: RunArgs,
-    table_path: str,
+    source: pl.LazyFrame,
     score_cols: list[str],
     requested_stats: set[str],
     thresholds: list[float],
@@ -290,7 +290,6 @@ def _run_eval_filter_combo(
     missing_mode: str | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
     combo_start = time.perf_counter()
-    source = scan_table(table_path)
     evaluator = _choose_evaluator(args.eval_level, source)
     prepared = evaluator.prepare_eval_frame(eval_col=eval_col, filter_col=filter_col)
     combo_missing_rows: list[dict[str, Any]] = []
@@ -303,92 +302,98 @@ def _run_eval_filter_combo(
             mode=missing_mode,
         )
 
+    need_labels = "auc" in requested_stats or "auprc" in requested_stats
+    need_cont = "enrichment" in requested_stats or "rate_ratio" in requested_stats
+
     combo_rows: list[dict[str, Any]] = []
     for score_col in score_cols:
         score_frame = evaluator.prepare_score_frame(prepared, score_col=score_col)
-        labels_scores = evaluator.labels_and_scores(score_frame, eval_col=eval_col, score_col=score_col)
-        labels = labels_scores[0] if labels_scores else None
-        scores = labels_scores[1] if labels_scores else None
 
-        if "auc" in requested_stats:
-            out = StatFactory.auc(labels, scores)
-            _append_binary_row(
-                rows=combo_rows,
-                eval_name=eval_col,
-                filter_name=filter_name,
-                score_name=score_col,
-                threshold=float("nan"),
-                stat_name=out.stat,
-                value=out.value,
-                p_value=out.p_value,
-                tp=float("nan"),
-                fp=float("nan"),
-                tn=float("nan"),
-                fn=float("nan"),
-                rows_used=score_frame.rows_used,
-                total_eval_rows=prepared.total_eval_rows,
-            )
-        if "auprc" in requested_stats:
-            out = StatFactory.auprc(labels, scores)
-            _append_binary_row(
-                rows=combo_rows,
-                eval_name=eval_col,
-                filter_name=filter_name,
-                score_name=score_col,
-                threshold=float("nan"),
-                stat_name=out.stat,
-                value=out.value,
-                p_value=out.p_value,
-                tp=float("nan"),
-                fp=float("nan"),
-                tn=float("nan"),
-                fn=float("nan"),
-                rows_used=score_frame.rows_used,
-                total_eval_rows=prepared.total_eval_rows,
-            )
+        if need_labels:
+            labels_scores = evaluator.labels_and_scores(score_frame, eval_col=eval_col, score_col=score_col)
+            labels = labels_scores[0] if labels_scores else None
+            scores = labels_scores[1] if labels_scores else None
+            if "auc" in requested_stats:
+                out = StatFactory.auc(labels, scores)
+                _append_binary_row(
+                    rows=combo_rows,
+                    eval_name=eval_col,
+                    filter_name=filter_name,
+                    score_name=score_col,
+                    threshold=float("nan"),
+                    stat_name=out.stat,
+                    value=out.value,
+                    p_value=out.p_value,
+                    tp=float("nan"),
+                    fp=float("nan"),
+                    tn=float("nan"),
+                    fn=float("nan"),
+                    rows_used=score_frame.rows_used,
+                    total_eval_rows=prepared.total_eval_rows,
+                )
+            if "auprc" in requested_stats:
+                out = StatFactory.auprc(labels, scores)
+                _append_binary_row(
+                    rows=combo_rows,
+                    eval_name=eval_col,
+                    filter_name=filter_name,
+                    score_name=score_col,
+                    threshold=float("nan"),
+                    stat_name=out.stat,
+                    value=out.value,
+                    p_value=out.p_value,
+                    tp=float("nan"),
+                    fp=float("nan"),
+                    tn=float("nan"),
+                    fn=float("nan"),
+                    rows_used=score_frame.rows_used,
+                    total_eval_rows=prepared.total_eval_rows,
+                )
 
-        for threshold in thresholds:
-            cont = evaluator.contingency(score_frame, eval_col=eval_col, score_col=score_col, threshold=threshold)
+        if need_cont and thresholds:
+            conts = evaluator.contingency_batch(
+                score_frame, eval_col=eval_col, score_col=score_col, thresholds=thresholds
+            )
             if "enrichment" in requested_stats:
-                out = StatFactory.enrichment(cont)
-                _append_binary_row(
-                    rows=combo_rows,
-                    eval_name=eval_col,
-                    filter_name=filter_name,
-                    score_name=score_col,
-                    threshold=threshold,
-                    stat_name=out.stat,
-                    value=out.value,
-                    p_value=out.p_value,
-                    tp=cont.tp,
-                    fp=cont.fp,
-                    tn=cont.tn,
-                    fn=cont.fn,
-                    rows_used=score_frame.rows_used,
-                    total_eval_rows=prepared.total_eval_rows,
-                )
+                enr_results = StatFactory.enrichment_batch(conts)
+                for threshold, cont, out in zip(thresholds, conts, enr_results):
+                    _append_binary_row(
+                        rows=combo_rows,
+                        eval_name=eval_col,
+                        filter_name=filter_name,
+                        score_name=score_col,
+                        threshold=threshold,
+                        stat_name=out.stat,
+                        value=out.value,
+                        p_value=out.p_value,
+                        tp=cont.tp,
+                        fp=cont.fp,
+                        tn=cont.tn,
+                        fn=cont.fn,
+                        rows_used=score_frame.rows_used,
+                        total_eval_rows=prepared.total_eval_rows,
+                    )
             if "rate_ratio" in requested_stats:
-                out = StatFactory.rate_ratio(
-                    cont=cont,
-                    case_total=args.case_total,
-                    ctrl_total=args.ctrl_total,
+                rr_results = StatFactory.rate_ratio_batch(
+                    conts, case_total=args.case_total, ctrl_total=args.ctrl_total
                 )
-                _append_binary_row(
-                    rows=combo_rows,
-                    eval_name=eval_col,
-                    filter_name=filter_name,
-                    score_name=score_col,
-                    threshold=threshold,
-                    stat_name=out.stat,
-                    value=out.value,
-                    p_value=out.p_value,
-                    tp=cont.tp,
-                    fp=cont.fp,
-                    tn=cont.tn,
-                    fn=cont.fn,
-                    rows_used=score_frame.rows_used,
-                    total_eval_rows=prepared.total_eval_rows,
-                )
+                for threshold, cont, out in zip(thresholds, conts, rr_results):
+                    _append_binary_row(
+                        rows=combo_rows,
+                        eval_name=eval_col,
+                        filter_name=filter_name,
+                        score_name=score_col,
+                        threshold=threshold,
+                        stat_name=out.stat,
+                        value=out.value,
+                        p_value=out.p_value,
+                        tp=cont.tp,
+                        fp=cont.fp,
+                        tn=cont.tn,
+                        fn=cont.fn,
+                        rows_used=score_frame.rows_used,
+                        total_eval_rows=prepared.total_eval_rows,
+                    )
     timing = {
         "eval_name": eval_col,
         "filter_name": filter_name,
@@ -402,6 +407,9 @@ def run(args: RunArgs) -> tuple[pl.DataFrame, list[dict[str, Any]], pl.DataFrame
     table = get_table_config(resources, args.table_name)
     thresholds = parse_thresholds(args.thresholds)
     requested_stats = parse_stats(args.stat)
+
+    # Share a single LazyFrame across all workers so parquet metadata is read once.
+    source = scan_table(table.path)
 
     eval_cols = _resolve_eval_cols(args.eval_set, table.evals, args.eval_level)
     filter_pairs = _resolve_filter_cols(args.filters, table.filters)
@@ -423,7 +431,7 @@ def run(args: RunArgs) -> tuple[pl.DataFrame, list[dict[str, Any]], pl.DataFrame
         for idx, eval_col, filter_name, filter_col in combos:
             combo_rows, combo_timing, combo_missing_rows = _run_eval_filter_combo(
                 args=args,
-                table_path=table.path,
+                source=source,
                 score_cols=table.score_cols,
                 requested_stats=requested_stats,
                 thresholds=thresholds,
@@ -441,7 +449,7 @@ def run(args: RunArgs) -> tuple[pl.DataFrame, list[dict[str, Any]], pl.DataFrame
                 executor.submit(
                     _run_eval_filter_combo,
                     args,
-                    table.path,
+                    source,
                     table.score_cols,
                     requested_stats,
                     thresholds,

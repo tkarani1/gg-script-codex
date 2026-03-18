@@ -46,12 +46,17 @@ class BaseEvaluator(ABC):
         return PreparedFrame(frame=lf, total_eval_rows=total_eval_rows)
 
     def prepare_score_frame(self, prepared: PreparedFrame, score_col: str) -> ScoreFrame:
-        lf = prepared.frame.filter(pl.col(score_col).is_not_null())
-        rows_used = int(lf.select(pl.len().alias("n")).collect(streaming=True)["n"][0])
-        return ScoreFrame(frame=lf, rows_used=rows_used)
+        df = prepared.frame.filter(pl.col(score_col).is_not_null()).collect(streaming=True)
+        return ScoreFrame(frame=df.lazy(), rows_used=df.height)
 
     @abstractmethod
     def contingency(self, score_frame: ScoreFrame, eval_col: str, score_col: str, threshold: float) -> Contingency:
+        raise NotImplementedError
+
+    @abstractmethod
+    def contingency_batch(
+        self, score_frame: ScoreFrame, eval_col: str, score_col: str, thresholds: list[float]
+    ) -> list[Contingency]:
         raise NotImplementedError
 
     @abstractmethod

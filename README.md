@@ -4,7 +4,7 @@ Memory-efficient CLI for genomic statistics on merged Parquet tables using Polar
 
 ## Features
 
-- Computes `auc`, `auprc`, `enrichment`, and `rate_ratio`
+- Computes `auc`, `auprc`, `enrichment`, `rate_ratio`, `pairwise_enrichment`, and `pairwise_rate_ratio`
 - Supports `variant` and `gene` eval levels (strategy-based evaluators)
 - Reads local paths and `gs://` parquet inputs via Polars/fsspec/gcsfs
 - Writes:
@@ -32,7 +32,15 @@ pip install -e .
       "Level": "variant",
       "Score_cols": ["AM_percentile", "score_PAI3D_percentile"],
       "Filters": {"ordered": "filter_ordered"},
-      "evals": ["is_pos__schema", "is_pos_dd"]
+      "evals": ["is_pos__schema", "is_pos_dd"],
+      "Case_totals": {
+        "is_pos__schema": 1000,
+        "is_pos_dd": 1200
+      },
+      "Ctrl_totals": {
+        "is_pos__schema": 5000,
+        "is_pos_dd": 5200
+      }
     }
   }
 }
@@ -43,13 +51,21 @@ pip install -e .
 - `--resources-json` path to resources file (default: `resources.json`)
 - `--table-name` table key under `Table_info` (**required**)
 - `--eval-level` `variant` or `gene` (**required**)
-- `--stat` `all` or csv subset (`auc,auprc,enrichment,rate_ratio`)
+- `--stat` `all` or csv subset (`auc,auprc,enrichment,rate_ratio,pairwise_enrichment,pairwise_rate_ratio`)
 - `--eval-set` optional csv eval override (defaults to all `evals` from resources)
 - `--filters` optional csv logical filter names (from `Filters` keys); `none` is always included
 - `--thresholds` optional csv thresholds
 - `--case-total`, `--ctrl-total` optional denominators for rate ratio
+- `--case-total-by-eval` optional per-eval case totals (`eval_name:value,eval2:value2`)
+- `--ctrl-total-by-eval` optional per-eval control totals (`eval_name:value,eval2:value2`)
 - `--out-fname` output naming schema/prefix (**required**)
 - `--write-missing` controls missing-entity report: `none`, `all`, or `any` (default: `none`)
+
+Rate-ratio denominator resolution priority (high to low):
+
+1. per-eval CLI overrides (`--case-total-by-eval`, `--ctrl-total-by-eval`)
+2. per-eval table metadata (`Case_totals`, `Ctrl_totals` in resources JSON)
+3. global CLI totals (`--case-total`, `--ctrl-total`)
 
 Output paths are derived from `--out-fname`:
 
@@ -83,6 +99,63 @@ Columns:
 - `tp`, `fp`, `tn`, `fn`
 - `rows_used`
 - `total_eval_rows`
+
+For pairwise stats (`pairwise_enrichment`, `pairwise_rate_ratio`), additional columns:
+
+- `anchor_value` - baseline value from anchor VSM on full set
+- `adjustment_ratio` - ratio of VSM performance to anchor performance on pairwise intersection
+
+## Pairwise statistics
+
+Pairwise statistics compute adjusted enrichment/rate_ratio that maximize variant coverage per VSM comparison.
+
+### Formula
+
+```
+enr(VSM_i) = enr(VSM*, S* ∩ S_e) × [enr(VSM_i, S_i ∩ S* ∩ S_e) / enr(VSM*, S_i ∩ S* ∩ S_e)]
+```
+
+Where:
+- `VSM*` is the anchor VSM (the one with maximum variant coverage)
+- `S*` is the set of variants defined by the anchor
+- `S_i` is the set of variants defined by VSM_i
+- `S_e` is the evaluation set (after filtering)
+
+### Required input table format
+
+Pairwise statistics require pre-computed percentile columns with specific naming:
+
+| Column Pattern | Description |
+|----------------|-------------|
+| `{anchor}_anchor_percentile` | Anchor percentile on full set S* |
+| `{vsm}_percentile_with_anchor` | VSM_i percentile on S_i ∩ S* |
+| `{anchor}_anchor_percentile_with_{vsm_short}` | Anchor percentile on S_i ∩ S* |
+
+Example columns for anchor `mpc_score` with VSMs `esm1b_score` and `MisFit_S_score`:
+
+```
+mpc_score_anchor_percentile
+esm1b_score_percentile_with_anchor
+mpc_score_anchor_percentile_with_esm1b
+MisFit_S_score_percentile_with_anchor
+mpc_score_anchor_percentile_with_MisFit_S
+```
+
+The column structure is auto-detected; no additional JSON configuration required.
+
+### Example usage
+
+```bash
+python -m biostat_cli.cli \
+  --resources-json ../files/vsm_all.json \
+  --table-name VSM_pairwise_table \
+  --eval-level variant \
+  --stat "pairwise_enrichment,pairwise_rate_ratio" \
+  --thresholds 0.90,0.95,0.98,0.99 \
+  --case-total 1000 \
+  --ctrl-total 5000 \
+  --out-fname ../results/VSM_pairwise
+```
 
 ## Missing-output TSV (optional)
 

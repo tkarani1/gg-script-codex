@@ -2,6 +2,7 @@ README.md
 pyproject.toml
 biostat_cli/__init__.py
 biostat_cli/cli.py
+biostat_cli/cli_parallel.py
 biostat_cli/config.py
 biostat_cli/io.py
 biostat_cli.egg-info/PKG-INFO
