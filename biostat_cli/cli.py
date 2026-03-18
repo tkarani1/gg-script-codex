@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import polars as pl
 
 from biostat_cli.config import (
@@ -20,7 +22,7 @@ from biostat_cli.config import (
     parse_stats,
     parse_thresholds,
 )
-from biostat_cli.evaluators.base import BaseEvaluator, Contingency
+from biostat_cli.evaluators.base import BaseEvaluator, Contingency, PreparedFrame
 from biostat_cli.evaluators.gene import GeneEvaluator, SUM_VARIANTS_SENTINEL
 from biostat_cli.evaluators.variant import VariantEvaluator
 from biostat_cli.io import scan_table, write_json, write_tsv
@@ -42,6 +44,7 @@ class RunArgs:
     ctrl_total: float | None
     case_total_by_eval: str | None
     ctrl_total_by_eval: str | None
+    bootstrap_samples: int | None
     out_fname: str
     write_missing: str
 
@@ -66,6 +69,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--ctrl-total-by-eval",
         default=None,
         help='Comma-separated per-eval control totals in format "eval_name:value"',
+    )
+    parser.add_argument(
+        "--bootstrap",
+        nargs="?",
+        const=100,
+        type=int,
+        default=None,
+        metavar="N",
+        help="Enable nonparametric row-bootstrap and optionally set samples, e.g. --bootstrap 50 (default: 100)",
     )
     parser.add_argument("--out-fname", required=True)
     parser.add_argument("--write-missing", choices=["none", "all", "any"], default="none")
@@ -195,6 +207,34 @@ def _resolve_eval_totals(
     case_total = cli_case_totals.get(eval_col, table_case_totals.get(eval_col, global_case_total))
     ctrl_total = cli_ctrl_totals.get(eval_col, table_ctrl_totals.get(eval_col, global_ctrl_total))
     return case_total, ctrl_total
+
+
+def _threshold_key(value: float) -> str:
+    if isinstance(value, float) and math.isnan(value):
+        return "nan"
+    return f"{value:.12g}"
+
+
+def _row_identity_key(row: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    return (
+        str(row["eval_name"]),
+        str(row["filter_name"]),
+        str(row["score_name"]),
+        _threshold_key(float(row["threshold"])),
+        str(row["stat"]),
+    )
+
+
+def _compute_std_error(values: list[float]) -> float:
+    clean = np.asarray([v for v in values if not (isinstance(v, float) and math.isnan(v))], dtype=float)
+    if clean.size < 2:
+        return math.nan
+    return float(np.std(clean, ddof=1))
+
+
+def _validate_bootstrap_args(args: RunArgs) -> None:
+    if args.bootstrap_samples is not None and args.bootstrap_samples < 2:
+        raise ValueError("--bootstrap N must be >= 2 when bootstrap is enabled.")
 
 
 def _resolve_output_paths(out_fname: str) -> dict[str, str]:
@@ -352,7 +392,199 @@ def _build_missing_variant_rows(
     return report.select(out_cols).collect(streaming=True).to_dicts()
 
 
+def _compute_rows_for_prepared(
+    evaluator: BaseEvaluator,
+    prepared: PreparedFrame,
+    eval_col: str,
+    filter_name: str,
+    score_cols: list[str],
+    requested_stats: set[str],
+    thresholds: list[float],
+    eval_case_total: float | None,
+    eval_ctrl_total: float | None,
+    pairwise_cols: PairwiseColumns | None,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    need_labels = "auc" in requested_stats or "auprc" in requested_stats
+    need_cont = "enrichment" in requested_stats or "rate_ratio" in requested_stats
+    need_pairwise = bool(requested_stats & PAIRWISE_STATS)
+
+    for score_col in score_cols:
+        score_frame = evaluator.prepare_score_frame(prepared, score_col=score_col)
+
+        if need_labels:
+            labels_scores = evaluator.labels_and_scores(score_frame, eval_col=eval_col, score_col=score_col)
+            labels = labels_scores[0] if labels_scores else None
+            scores = labels_scores[1] if labels_scores else None
+            if "auc" in requested_stats:
+                out = StatFactory.auc(labels, scores)
+                _append_binary_row(
+                    rows=rows,
+                    eval_name=eval_col,
+                    filter_name=filter_name,
+                    score_name=score_col,
+                    threshold=float("nan"),
+                    stat_name=out.stat,
+                    value=out.value,
+                    p_value=out.p_value,
+                    tp=float("nan"),
+                    fp=float("nan"),
+                    tn=float("nan"),
+                    fn=float("nan"),
+                    rows_used=score_frame.rows_used,
+                    total_eval_rows=prepared.total_eval_rows,
+                )
+            if "auprc" in requested_stats:
+                out = StatFactory.auprc(labels, scores)
+                _append_binary_row(
+                    rows=rows,
+                    eval_name=eval_col,
+                    filter_name=filter_name,
+                    score_name=score_col,
+                    threshold=float("nan"),
+                    stat_name=out.stat,
+                    value=out.value,
+                    p_value=out.p_value,
+                    tp=float("nan"),
+                    fp=float("nan"),
+                    tn=float("nan"),
+                    fn=float("nan"),
+                    rows_used=score_frame.rows_used,
+                    total_eval_rows=prepared.total_eval_rows,
+                )
+
+        if need_cont and thresholds:
+            conts = evaluator.contingency_batch(score_frame, eval_col=eval_col, score_col=score_col, thresholds=thresholds)
+            if "enrichment" in requested_stats:
+                enr_results = StatFactory.enrichment_batch(conts)
+                for threshold, cont, out in zip(thresholds, conts, enr_results):
+                    _append_binary_row(
+                        rows=rows,
+                        eval_name=eval_col,
+                        filter_name=filter_name,
+                        score_name=score_col,
+                        threshold=threshold,
+                        stat_name=out.stat,
+                        value=out.value,
+                        p_value=out.p_value,
+                        tp=cont.tp,
+                        fp=cont.fp,
+                        tn=cont.tn,
+                        fn=cont.fn,
+                        rows_used=score_frame.rows_used,
+                        total_eval_rows=prepared.total_eval_rows,
+                    )
+            if "rate_ratio" in requested_stats:
+                rr_results = StatFactory.rate_ratio_batch(conts, case_total=eval_case_total, ctrl_total=eval_ctrl_total)
+                for threshold, cont, out in zip(thresholds, conts, rr_results):
+                    _append_binary_row(
+                        rows=rows,
+                        eval_name=eval_col,
+                        filter_name=filter_name,
+                        score_name=score_col,
+                        threshold=threshold,
+                        stat_name=out.stat,
+                        value=out.value,
+                        p_value=out.p_value,
+                        tp=cont.tp,
+                        fp=cont.fp,
+                        tn=cont.tn,
+                        fn=cont.fn,
+                        rows_used=score_frame.rows_used,
+                        total_eval_rows=prepared.total_eval_rows,
+                    )
+
+    if need_pairwise and pairwise_cols is not None and thresholds:
+        anchor_score_frame = evaluator.prepare_score_frame(prepared, score_col=pairwise_cols.anchor_full_col)
+        anchor_conts_full = evaluator.contingency_batch(
+            anchor_score_frame, eval_col=eval_col, score_col=pairwise_cols.anchor_full_col, thresholds=thresholds
+        )
+
+        for vsm_base, vsm_col, anchor_pairwise_col in pairwise_cols.vsm_pairs:
+            pairwise_lf = prepared.frame.filter(pl.col(vsm_col).is_not_null() & pl.col(anchor_pairwise_col).is_not_null())
+            pairwise_df = pairwise_lf.collect(streaming=True)
+            pairwise_rows_used = pairwise_df.height
+            if pairwise_rows_used == 0:
+                continue
+
+            pairwise_prepared = PreparedFrame(frame=pairwise_df.lazy(), total_eval_rows=pairwise_rows_used)
+            vsm_conts = evaluator.contingency_batch(
+                evaluator.prepare_score_frame(pairwise_prepared, score_col=vsm_col),
+                eval_col=eval_col,
+                score_col=vsm_col,
+                thresholds=thresholds,
+            )
+            anchor_conts_pairwise = evaluator.contingency_batch(
+                evaluator.prepare_score_frame(pairwise_prepared, score_col=anchor_pairwise_col),
+                eval_col=eval_col,
+                score_col=anchor_pairwise_col,
+                thresholds=thresholds,
+            )
+
+            for threshold, anchor_cont_full, anchor_cont_pw, vsm_cont in zip(
+                thresholds, anchor_conts_full, anchor_conts_pairwise, vsm_conts
+            ):
+                if "pairwise_enrichment" in requested_stats:
+                    out = StatFactory.pairwise_enrichment(anchor_cont_full, anchor_cont_pw, vsm_cont)
+                    _append_pairwise_row(
+                        rows=rows,
+                        eval_name=eval_col,
+                        filter_name=filter_name,
+                        score_name=vsm_base,
+                        threshold=threshold,
+                        out=out,
+                        cont=vsm_cont,
+                        rows_used=pairwise_rows_used,
+                        total_eval_rows=prepared.total_eval_rows,
+                    )
+                if "pairwise_rate_ratio" in requested_stats:
+                    out = StatFactory.pairwise_rate_ratio(
+                        anchor_cont_full, anchor_cont_pw, vsm_cont, eval_case_total, eval_ctrl_total
+                    )
+                    _append_pairwise_row(
+                        rows=rows,
+                        eval_name=eval_col,
+                        filter_name=filter_name,
+                        score_name=vsm_base,
+                        threshold=threshold,
+                        out=out,
+                        cont=vsm_cont,
+                        rows_used=pairwise_rows_used,
+                        total_eval_rows=prepared.total_eval_rows,
+                    )
+
+        for threshold, anchor_cont in zip(thresholds, anchor_conts_full):
+            if "pairwise_enrichment" in requested_stats:
+                out = StatFactory.pairwise_enrichment(anchor_cont, anchor_cont, anchor_cont)
+                _append_pairwise_row(
+                    rows=rows,
+                    eval_name=eval_col,
+                    filter_name=filter_name,
+                    score_name=pairwise_cols.anchor_base,
+                    threshold=threshold,
+                    out=out,
+                    cont=anchor_cont,
+                    rows_used=anchor_score_frame.rows_used,
+                    total_eval_rows=prepared.total_eval_rows,
+                )
+            if "pairwise_rate_ratio" in requested_stats:
+                out = StatFactory.pairwise_rate_ratio(anchor_cont, anchor_cont, anchor_cont, eval_case_total, eval_ctrl_total)
+                _append_pairwise_row(
+                    rows=rows,
+                    eval_name=eval_col,
+                    filter_name=filter_name,
+                    score_name=pairwise_cols.anchor_base,
+                    threshold=threshold,
+                    out=out,
+                    cont=anchor_cont,
+                    rows_used=anchor_score_frame.rows_used,
+                    total_eval_rows=prepared.total_eval_rows,
+                )
+    return rows
+
+
 def run(args: RunArgs) -> tuple[pl.DataFrame, list[dict[str, Any]], pl.DataFrame]:
+    _validate_bootstrap_args(args)
     resources = load_resources(args.resources_json)
     table = get_table_config(resources, args.table_name)
     thresholds = parse_thresholds(args.thresholds)
@@ -406,195 +638,51 @@ def run(args: RunArgs) -> tuple[pl.DataFrame, list[dict[str, Any]], pl.DataFrame
                         mode=args.write_missing,
                     )
                 )
+            combo_rows = _compute_rows_for_prepared(
+                evaluator=evaluator,
+                prepared=prepared,
+                eval_col=eval_col,
+                filter_name=filter_name,
+                score_cols=table.score_cols,
+                requested_stats=requested_stats,
+                thresholds=thresholds,
+                eval_case_total=eval_case_total,
+                eval_ctrl_total=eval_ctrl_total,
+                pairwise_cols=pairwise_cols,
+            )
 
-            need_labels = "auc" in requested_stats or "auprc" in requested_stats
-            need_cont = "enrichment" in requested_stats or "rate_ratio" in requested_stats
-
-            for score_col in table.score_cols:
-                score_frame = evaluator.prepare_score_frame(prepared, score_col=score_col)
-
-                if need_labels:
-                    labels_scores = evaluator.labels_and_scores(score_frame, eval_col=eval_col, score_col=score_col)
-                    labels = labels_scores[0] if labels_scores else None
-                    scores = labels_scores[1] if labels_scores else None
-                    if "auc" in requested_stats:
-                        out = StatFactory.auc(labels, scores)
-                        _append_binary_row(
-                            rows=rows,
-                            eval_name=eval_col,
+            # Bootstrap std_error is computed from replicate values only; point value/p_value stay from combo_rows.
+            if args.bootstrap_samples is not None and combo_rows:
+                base_df = prepared.frame.collect(streaming=True)
+                n_rows = base_df.height
+                bootstrap_values_by_key: dict[tuple[str, str, str, str, str], list[float]] = {}
+                if n_rows > 0:
+                    rng = np.random.default_rng(42)
+                    for _ in range(args.bootstrap_samples):
+                        sampled_df = base_df.sample(n=n_rows, with_replacement=True, shuffle=False, seed=int(rng.integers(0, 2**31 - 1)))
+                        sample_prepared = PreparedFrame(frame=sampled_df.lazy(), total_eval_rows=sampled_df.height)
+                        sample_evaluator = _choose_evaluator(args.eval_level, sample_prepared.frame)
+                        sample_rows = _compute_rows_for_prepared(
+                            evaluator=sample_evaluator,
+                            prepared=sample_prepared,
+                            eval_col=eval_col,
                             filter_name=filter_name,
-                            score_name=score_col,
-                            threshold=float("nan"),
-                            stat_name=out.stat,
-                            value=out.value,
-                            p_value=out.p_value,
-                            tp=float("nan"),
-                            fp=float("nan"),
-                            tn=float("nan"),
-                            fn=float("nan"),
-                            rows_used=score_frame.rows_used,
-                            total_eval_rows=prepared.total_eval_rows,
+                            score_cols=table.score_cols,
+                            requested_stats=requested_stats,
+                            thresholds=thresholds,
+                            eval_case_total=eval_case_total,
+                            eval_ctrl_total=eval_ctrl_total,
+                            pairwise_cols=pairwise_cols,
                         )
-                    if "auprc" in requested_stats:
-                        out = StatFactory.auprc(labels, scores)
-                        _append_binary_row(
-                            rows=rows,
-                            eval_name=eval_col,
-                            filter_name=filter_name,
-                            score_name=score_col,
-                            threshold=float("nan"),
-                            stat_name=out.stat,
-                            value=out.value,
-                            p_value=out.p_value,
-                            tp=float("nan"),
-                            fp=float("nan"),
-                            tn=float("nan"),
-                            fn=float("nan"),
-                            rows_used=score_frame.rows_used,
-                            total_eval_rows=prepared.total_eval_rows,
-                        )
-
-                if need_cont and thresholds:
-                    conts = evaluator.contingency_batch(
-                        score_frame, eval_col=eval_col, score_col=score_col, thresholds=thresholds
-                    )
-                    if "enrichment" in requested_stats:
-                        enr_results = StatFactory.enrichment_batch(conts)
-                        for threshold, cont, out in zip(thresholds, conts, enr_results):
-                            _append_binary_row(
-                                rows=rows,
-                                eval_name=eval_col,
-                                filter_name=filter_name,
-                                score_name=score_col,
-                                threshold=threshold,
-                                stat_name=out.stat,
-                                value=out.value,
-                                p_value=out.p_value,
-                                tp=cont.tp,
-                                fp=cont.fp,
-                                tn=cont.tn,
-                                fn=cont.fn,
-                                rows_used=score_frame.rows_used,
-                                total_eval_rows=prepared.total_eval_rows,
-                            )
-                    if "rate_ratio" in requested_stats:
-                        rr_results = StatFactory.rate_ratio_batch(conts, case_total=eval_case_total, ctrl_total=eval_ctrl_total)
-                        for threshold, cont, out in zip(thresholds, conts, rr_results):
-                            _append_binary_row(
-                                rows=rows,
-                                eval_name=eval_col,
-                                filter_name=filter_name,
-                                score_name=score_col,
-                                threshold=threshold,
-                                stat_name=out.stat,
-                                value=out.value,
-                                p_value=out.p_value,
-                                tp=cont.tp,
-                                fp=cont.fp,
-                                tn=cont.tn,
-                                fn=cont.fn,
-                                rows_used=score_frame.rows_used,
-                                total_eval_rows=prepared.total_eval_rows,
-                            )
-
-            # Pairwise stats: compute adjusted enrichment/rate_ratio for each VSM
-            if need_pairwise and pairwise_cols is not None and thresholds:
-                # Compute anchor contingency on full set (S* ∩ S_e)
-                anchor_score_frame = evaluator.prepare_score_frame(prepared, score_col=pairwise_cols.anchor_full_col)
-                anchor_conts_full = evaluator.contingency_batch(
-                    anchor_score_frame, eval_col=eval_col, score_col=pairwise_cols.anchor_full_col, thresholds=thresholds
-                )
-
-                # For each VSM pair, compute adjusted statistics
-                for vsm_base, vsm_col, anchor_pairwise_col in pairwise_cols.vsm_pairs:
-                    # Prepare frame for pairwise intersection (filter where both VSM and anchor have values)
-                    pairwise_lf = prepared.frame.filter(
-                        pl.col(vsm_col).is_not_null() & pl.col(anchor_pairwise_col).is_not_null()
-                    )
-                    pairwise_df = pairwise_lf.collect(streaming=True)
-                    pairwise_rows_used = pairwise_df.height
-
-                    if pairwise_rows_used == 0:
-                        continue
-
-                    # Compute VSM contingency on pairwise intersection
-                    vsm_conts = evaluator.contingency_batch(
-                        evaluator.prepare_score_frame(prepared, score_col=vsm_col),
-                        eval_col=eval_col,
-                        score_col=vsm_col,
-                        thresholds=thresholds,
-                    )
-
-                    # Compute anchor contingency on pairwise intersection
-                    anchor_conts_pairwise = evaluator.contingency_batch(
-                        evaluator.prepare_score_frame(prepared, score_col=anchor_pairwise_col),
-                        eval_col=eval_col,
-                        score_col=anchor_pairwise_col,
-                        thresholds=thresholds,
-                    )
-
-                    for threshold, anchor_cont_full, anchor_cont_pw, vsm_cont in zip(
-                        thresholds, anchor_conts_full, anchor_conts_pairwise, vsm_conts
-                    ):
-                        if "pairwise_enrichment" in requested_stats:
-                            out = StatFactory.pairwise_enrichment(anchor_cont_full, anchor_cont_pw, vsm_cont)
-                            _append_pairwise_row(
-                                rows=rows,
-                                eval_name=eval_col,
-                                filter_name=filter_name,
-                                score_name=vsm_base,
-                                threshold=threshold,
-                                out=out,
-                                cont=vsm_cont,
-                                rows_used=pairwise_rows_used,
-                                total_eval_rows=prepared.total_eval_rows,
-                            )
-                        if "pairwise_rate_ratio" in requested_stats:
-                            out = StatFactory.pairwise_rate_ratio(
-                                anchor_cont_full, anchor_cont_pw, vsm_cont, eval_case_total, eval_ctrl_total
-                            )
-                            _append_pairwise_row(
-                                rows=rows,
-                                eval_name=eval_col,
-                                filter_name=filter_name,
-                                score_name=vsm_base,
-                                threshold=threshold,
-                                out=out,
-                                cont=vsm_cont,
-                                rows_used=pairwise_rows_used,
-                                total_eval_rows=prepared.total_eval_rows,
-                            )
-
-                # Also output the anchor VSM itself with adjustment_ratio=1.0
-                for threshold, anchor_cont in zip(thresholds, anchor_conts_full):
-                    if "pairwise_enrichment" in requested_stats:
-                        out = StatFactory.pairwise_enrichment(anchor_cont, anchor_cont, anchor_cont)
-                        _append_pairwise_row(
-                            rows=rows,
-                            eval_name=eval_col,
-                            filter_name=filter_name,
-                            score_name=pairwise_cols.anchor_base,
-                            threshold=threshold,
-                            out=out,
-                            cont=anchor_cont,
-                            rows_used=anchor_score_frame.rows_used,
-                            total_eval_rows=prepared.total_eval_rows,
-                        )
-                    if "pairwise_rate_ratio" in requested_stats:
-                        out = StatFactory.pairwise_rate_ratio(
-                            anchor_cont, anchor_cont, anchor_cont, eval_case_total, eval_ctrl_total
-                        )
-                        _append_pairwise_row(
-                            rows=rows,
-                            eval_name=eval_col,
-                            filter_name=filter_name,
-                            score_name=pairwise_cols.anchor_base,
-                            threshold=threshold,
-                            out=out,
-                            cont=anchor_cont,
-                            rows_used=anchor_score_frame.rows_used,
-                            total_eval_rows=prepared.total_eval_rows,
-                        )
+                        for row in sample_rows:
+                            key = _row_identity_key(row)
+                            bootstrap_values_by_key.setdefault(key, []).append(float(row["value"]))
+                for row in combo_rows:
+                    row["std_error"] = _compute_std_error(bootstrap_values_by_key.get(_row_identity_key(row), []))
+            else:
+                for row in combo_rows:
+                    row["std_error"] = math.nan
+            rows.extend(combo_rows)
 
             eval_filter_timings.append(
                 {
@@ -633,6 +721,7 @@ def main() -> None:
         ctrl_total=ns.ctrl_total,
         case_total_by_eval=ns.case_total_by_eval,
         ctrl_total_by_eval=ns.ctrl_total_by_eval,
+        bootstrap_samples=ns.bootstrap,
         out_fname=ns.out_fname,
         write_missing=ns.write_missing,
     )

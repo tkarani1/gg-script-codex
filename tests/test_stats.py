@@ -1,8 +1,17 @@
 import math
+import json
 
 import pytest
+import polars as pl
 
-from biostat_cli.cli import _resolve_eval_totals
+from biostat_cli.cli import (
+    RunArgs,
+    _compute_std_error,
+    _resolve_eval_totals,
+    _row_identity_key,
+    _validate_bootstrap_args,
+    run,
+)
 from biostat_cli.config import detect_pairwise_columns, parse_eval_totals
 from biostat_cli.evaluators.base import Contingency
 from biostat_cli.stats.binary import enrichment, pairwise_enrichment, pairwise_rate_ratio, rate_ratio
@@ -183,3 +192,170 @@ def test_resolve_eval_totals_fallbacks():
     )
     assert case_total == 999.0
     assert ctrl_total == 888.0
+
+
+def test_compute_std_error():
+    values = [1.0, 2.0, 3.0, 4.0]
+    out = _compute_std_error(values)
+    assert out > 0
+
+
+def test_compute_std_error_nan_filtering():
+    values = [1.0, float("nan"), 3.0]
+    out = _compute_std_error(values)
+    assert not math.isnan(out)
+
+
+def test_row_identity_key_nan_threshold():
+    row = {
+        "eval_name": "eval_a",
+        "filter_name": "none",
+        "score_name": "score_x",
+        "threshold": float("nan"),
+        "stat": "auc",
+    }
+    key = _row_identity_key(row)
+    assert key[3] == "nan"
+
+
+def test_validate_bootstrap_args():
+    args = RunArgs(
+        resources_json="resources.json",
+        table_name="t",
+        eval_level="variant",
+        stat="all",
+        eval_set=None,
+        filters=None,
+        thresholds=None,
+        case_total=None,
+        ctrl_total=None,
+        case_total_by_eval=None,
+        ctrl_total_by_eval=None,
+        bootstrap_samples=1,
+        out_fname="out",
+        write_missing="none",
+    )
+    with pytest.raises(ValueError):
+        _validate_bootstrap_args(args)
+
+
+def test_bootstrap_run_value_and_pvalue_stable(tmp_path):
+    df = pl.DataFrame(
+        {
+            "chrom": ["1", "1", "1", "1", "1", "1"],
+            "pos": [1, 2, 3, 4, 5, 6],
+            "ref": ["A"] * 6,
+            "alt": ["C"] * 6,
+            "eval_a": [True, False, True, False, True, False],
+            "score_x": [0.95, 0.85, 0.88, 0.1, 0.99, 0.4],
+        }
+    )
+    parquet_path = tmp_path / "toy.parquet"
+    resources_path = tmp_path / "resources.json"
+    out_prefix = tmp_path / "out"
+    df.write_parquet(str(parquet_path))
+    resources = {
+        "Table_info": {
+            "toy": {
+                "Path": str(parquet_path),
+                "Level": "variant",
+                "Score_cols": ["score_x"],
+                "evals": ["eval_a"],
+            }
+        }
+    }
+    resources_path.write_text(json.dumps(resources), encoding="utf-8")
+
+    base_args = RunArgs(
+        resources_json=str(resources_path),
+        table_name="toy",
+        eval_level="variant",
+        stat="enrichment",
+        eval_set=None,
+        filters=None,
+        thresholds="0.8",
+        case_total=None,
+        ctrl_total=None,
+        case_total_by_eval=None,
+        ctrl_total_by_eval=None,
+        bootstrap_samples=None,
+        out_fname=str(out_prefix),
+        write_missing="none",
+    )
+    base_df, _, _ = run(base_args)
+    base_row = base_df.to_dicts()[0]
+    assert math.isnan(base_row["std_error"])
+
+    boot_args = RunArgs(
+        resources_json=str(resources_path),
+        table_name="toy",
+        eval_level="variant",
+        stat="enrichment",
+        eval_set=None,
+        filters=None,
+        thresholds="0.8",
+        case_total=None,
+        ctrl_total=None,
+        case_total_by_eval=None,
+        ctrl_total_by_eval=None,
+        bootstrap_samples=20,
+        out_fname=str(out_prefix),
+        write_missing="none",
+    )
+    boot_df, _, _ = run(boot_args)
+    boot_row = boot_df.to_dicts()[0]
+    assert boot_row["value"] == pytest.approx(base_row["value"], rel=0, abs=1e-12)
+    assert boot_row["p_value"] == pytest.approx(base_row["p_value"], rel=0, abs=1e-12)
+    assert not math.isnan(boot_row["std_error"])
+
+
+def test_bootstrap_pairwise_std_error(tmp_path):
+    df = pl.DataFrame(
+        {
+            "chrom": ["1", "1", "1", "1", "1", "1", "1", "1"],
+            "pos": [1, 2, 3, 4, 5, 6, 7, 8],
+            "ref": ["A"] * 8,
+            "alt": ["C"] * 8,
+            "eval_a": [True, False, True, False, True, False, True, False],
+            "anchor_score_anchor_percentile": [0.9, 0.82, 0.95, 0.2, 0.85, 0.3, 0.88, 0.4],
+            "vsm1_score_percentile_with_anchor": [0.92, 0.86, 0.97, 0.25, 0.83, 0.2, 0.86, 0.5],
+            "anchor_score_anchor_percentile_with_vsm1": [0.89, 0.81, 0.94, 0.22, 0.84, 0.28, 0.87, 0.45],
+        }
+    )
+    parquet_path = tmp_path / "pairwise.parquet"
+    resources_path = tmp_path / "resources_pairwise.json"
+    out_prefix = tmp_path / "out_pairwise"
+    df.write_parquet(str(parquet_path))
+    resources = {
+        "Table_info": {
+            "pairwise": {
+                "Path": str(parquet_path),
+                "Level": "variant",
+                "Score_cols": ["anchor_score_anchor_percentile"],
+                "evals": ["eval_a"],
+            }
+        }
+    }
+    resources_path.write_text(json.dumps(resources), encoding="utf-8")
+
+    args = RunArgs(
+        resources_json=str(resources_path),
+        table_name="pairwise",
+        eval_level="variant",
+        stat="pairwise_enrichment",
+        eval_set=None,
+        filters=None,
+        thresholds="0.8",
+        case_total=None,
+        ctrl_total=None,
+        case_total_by_eval=None,
+        ctrl_total_by_eval=None,
+        bootstrap_samples=20,
+        out_fname=str(out_prefix),
+        write_missing="none",
+    )
+    out_df, _, _ = run(args)
+    rows = out_df.to_dicts()
+    assert rows
+    assert all("std_error" in row for row in rows)
+    assert any(not math.isnan(row["std_error"]) for row in rows)

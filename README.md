@@ -5,6 +5,7 @@ Memory-efficient CLI for genomic statistics on merged Parquet tables using Polar
 ## Features
 
 - Computes `auc`, `auprc`, `enrichment`, `rate_ratio`, `pairwise_enrichment`, and `pairwise_rate_ratio`
+- Optional nonparametric bootstrap stderr (`std_error`) for all supported stats
 - Supports `variant` and `gene` eval levels (strategy-based evaluators)
 - Reads local paths and `gs://` parquet inputs via Polars/fsspec/gcsfs
 - Writes:
@@ -58,6 +59,7 @@ pip install -e .
 - `--case-total`, `--ctrl-total` optional denominators for rate ratio
 - `--case-total-by-eval` optional per-eval case totals (`eval_name:value,eval2:value2`)
 - `--ctrl-total-by-eval` optional per-eval control totals (`eval_name:value,eval2:value2`)
+- `--bootstrap [N]` enable nonparametric row bootstrap stderr calculation; optional `N` sets sample count (e.g., `--bootstrap 50`, default `100` when `N` omitted)
 - `--out-fname` output naming schema/prefix (**required**)
 - `--write-missing` controls missing-entity report: `none`, `all`, or `any` (default: `none`)
 
@@ -66,6 +68,12 @@ Rate-ratio denominator resolution priority (high to low):
 1. per-eval CLI overrides (`--case-total-by-eval`, `--ctrl-total-by-eval`)
 2. per-eval table metadata (`Case_totals`, `Ctrl_totals` in resources JSON)
 3. global CLI totals (`--case-total`, `--ctrl-total`)
+
+Bootstrap behavior:
+
+- Point `value` and `p_value` are computed on the original dataset.
+- `std_error` is estimated from bootstrap resamples (rows sampled with replacement within each eval/filter subset).
+- `--bootstrap N` must use `N >= 2` when bootstrap is enabled.
 
 Output paths are derived from `--out-fname`:
 
@@ -95,6 +103,7 @@ Columns:
 - `threshold`
 - `stat`
 - `value`
+- `std_error`
 - `p_value`
 - `tp`, `fp`, `tn`, `fn`
 - `rows_used`
