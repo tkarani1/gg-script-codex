@@ -225,3 +225,66 @@ python -m biostat_cli.cli_parallel \
   --stat "enrichment,auc" \
   --out-fname ../results/VSM_v1_parallel
 ```
+
+## Figure 1 Pipeline (local-data-first)
+
+This repository now includes a one-command Figure 1-style pipeline that:
+
+- computes raw metrics (`enrichment`, `rate_ratio`)
+- computes pairwise-adjusted metrics (`pairwise_enrichment`, `pairwise_rate_ratio`)
+- builds a panel-ready table (default threshold `0.95`)
+- writes QC outputs
+- renders `raw`, `pairwise`, and `combined` plots
+
+Default config file:
+
+- `figure1_pipeline_config.json` (panels, evals, score column names — **not** parquet paths)
+
+Parquet inputs are **required on the CLI** for `run` and `compute` so you can swap tables without editing the preset.
+
+### Quick start
+
+```bash
+figure1-pipeline run \
+  --config figure1_pipeline_config.json \
+  --mode both \
+  --raw-parquet /path/to/vsm_all_figure1_ready.parquet \
+  --pairwise-parquet /path/to/vsm_pairwise_mpc_anchor_figure1_ready.parquet
+```
+
+### Other modes
+
+```bash
+# Compute TSV/QC only (no plotting)
+figure1-pipeline compute \
+  --config figure1_pipeline_config.json \
+  --mode both \
+  --raw-parquet /path/to/vsm_all_figure1_ready.parquet \
+  --pairwise-parquet /path/to/vsm_pairwise_mpc_anchor_figure1_ready.parquet
+
+# Plot from an existing panel table
+figure1-pipeline plot --config figure1_pipeline_config.json --mode both --panel-table /path/to/panel_table.tsv
+```
+
+### Helpful options
+
+- `--raw-parquet` / `--pairwise-parquet` — required for `run`/`compute` when the mode includes that family (`raw`, `pairwise`, or `both`)
+- `--outdir /path/to/output_dir` to choose output location
+- `--threshold 0.95` to select panel-plot threshold
+- `--thresholds 0.90,0.95,0.98,0.99` to override compute thresholds
+- `--dry-run` to preview what will run (for `run`/`compute`, also runs preflight validation on the parquets)
+
+### Expected outputs
+
+Each run directory contains:
+
+- `figure1_run_resources.json` (ephemeral resources file written for this run; points at the CLI parquets)
+- `metrics_raw.tsv` (when mode includes `raw`)
+- `metrics_pairwise.tsv` (when mode includes `pairwise`)
+- `panel_table.tsv`
+- `qc_summary.tsv`
+- `qc_report.md`
+- `run_manifest.json`
+- `figure1_raw.png/pdf` (when mode includes `raw`)
+- `figure1_pairwise.png/pdf` (when mode includes `pairwise`)
+- `figure1_combined.png/pdf` (when mode is `both`)

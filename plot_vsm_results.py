@@ -9,6 +9,9 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
+PLOT_STATS = {"enrichment", "rate_ratio", "pairwise_enrichment", "pairwise_rate_ratio"}
+
+
 def _safe_name(text: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in text)
 
@@ -18,13 +21,36 @@ def _pretty_score_name(text: str) -> str:
     return " ".join(token for token in text.split() if token.lower() != "percentile")
 
 
+def _y_axis_label(stat: str) -> str:
+    if stat.endswith("rate_ratio"):
+        return "Rate ratio value"
+    return "Enrichment value"
+
+
+def _rows_used_pct_text(rows_used: object, total_eval_rows: object) -> str:
+    rows_used_num = pd.to_numeric(pd.Series([rows_used]), errors="coerce").iloc[0]
+    total_eval_num = pd.to_numeric(pd.Series([total_eval_rows]), errors="coerce").iloc[0]
+    if pd.isna(rows_used_num) or pd.isna(total_eval_num) or not total_eval_num:
+        return "NA"
+    return f"{(rows_used_num / total_eval_num) * 100:.1f}%"
+
+
+def _anchor_row_index_for_pairwise(group: pd.DataFrame) -> int | None:
+    """Identify anchor row in pairwise outputs via adjustment_ratio ~= 1."""
+    adjustment_vals = pd.to_numeric(group["adjustment_ratio"], errors="coerce")
+    for idx, value in enumerate(adjustment_vals.tolist()):
+        if pd.notna(value) and abs(float(value) - 1.0) < 1e-9:
+            return idx
+    return None
+
+
 def plot_enrichment_by_group(input_tsv: Path, output_dir: Path) -> None:
     df = pd.read_csv(input_tsv, sep="\t")
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df["threshold"] = df["threshold"].astype(str)
 
-    # Plot both enrichment and rate_ratio as dot plots.
-    plot_df = df[df["stat"].isin(["enrichment", "rate_ratio"]) & df["value"].notna()].copy()
+    # Plot enrichment/rate-ratio and their pairwise-adjusted counterparts as dot plots.
+    plot_df = df[df["stat"].isin(PLOT_STATS) & df["value"].notna()].copy()
     group_cols = ["eval_name", "filter_name", "stat", "threshold"]
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -34,6 +60,15 @@ def plot_enrichment_by_group(input_tsv: Path, output_dir: Path) -> None:
 
         fig, ax = plt.subplots(figsize=(10, 5))
         x_labels = [_pretty_score_name(v) for v in group["score_name"].astype(str).tolist()]
+        if stat.startswith("pairwise_"):
+            anchor_idx = _anchor_row_index_for_pairwise(group)
+            pairwise_labels: list[str] = []
+            for idx, (method_name, rows_used, total_eval) in enumerate(
+                zip(x_labels, group["rows_used"].tolist(), group["total_eval_rows"].tolist())
+            ):
+                method_label = f"{method_name}*" if anchor_idx is not None and idx == anchor_idx else method_name
+                pairwise_labels.append(f"{method_label}\n{_rows_used_pct_text(rows_used, total_eval)}")
+            x_labels = pairwise_labels
         x_pos = range(len(x_labels))
         y_vals = group["value"].tolist()
         same_rows_used_for_rate = False
@@ -41,15 +76,20 @@ def plot_enrichment_by_group(input_tsv: Path, output_dir: Path) -> None:
 
         ax.scatter(x_pos, y_vals, s=70)
         ax.set_xticks(list(x_pos))
-        ax.set_xticklabels(x_labels, rotation=45, ha="right")
-        ax.set_ylabel("Enrichment value")
+        if stat.startswith("pairwise_"):
+            ax.set_xticklabels(x_labels, rotation=0, ha="center")
+        else:
+            ax.set_xticklabels(x_labels, rotation=45, ha="right")
+        ax.set_ylabel(_y_axis_label(stat))
+        if stat.endswith("enrichment"):
+            ax.set_ylim(bottom=0)
         ax.set_xlabel("Score")
         ax.set_title(
             f"eval={eval_name} | filter={filter_name} | stat={stat} | threshold={threshold}"
         )
         ax.grid(axis="y", alpha=0.25)
 
-        if stat == "rate_ratio":
+        if stat.endswith("rate_ratio"):
             row_used_vals = pd.to_numeric(group["rows_used"], errors="coerce")
             total_eval_vals = pd.to_numeric(group["total_eval_rows"], errors="coerce")
             max_total_eval = total_eval_vals.max(skipna=True)
@@ -95,8 +135,16 @@ def plot_enrichment_by_group(input_tsv: Path, output_dir: Path) -> None:
         rows_used_text = ", ".join(str(int(v)) for v in rows_used_values) or "NA"
         total_rows_text = ", ".join(str(int(v)) for v in total_eval_rows_values) or "NA"
         note = f"rows_used: {rows_used_text}\ntotal_eval_rows: {total_rows_text}"
-        if stat == "rate_ratio" and same_rows_used_for_rate:
+        if stat.endswith("rate_ratio") and same_rows_used_for_rate:
             note = f"{note}\nrows_used_pct: {common_rows_used_pct_text}"
+        if stat.startswith("pairwise_"):
+            anchor_values = pd.to_numeric(group["anchor_value"], errors="coerce").dropna().unique().tolist()
+            adjustment_values = (
+                pd.to_numeric(group["adjustment_ratio"], errors="coerce").dropna().unique().tolist()
+            )
+            anchor_text = ", ".join(f"{v:.4g}" for v in anchor_values) or "NA"
+            adjustment_text = ", ".join(f"{v:.4g}" for v in adjustment_values) or "NA"
+            note = f"{note}\nanchor_value: {anchor_text}\nadjustment_ratio: {adjustment_text}"
 
         ax.text(
             0.98,
@@ -122,7 +170,10 @@ def plot_enrichment_by_group(input_tsv: Path, output_dir: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Plot enrichment dot plots grouped by eval_name/filter_name/stat/threshold."
+        description=(
+            "Plot enrichment/rate-ratio dot plots (including pairwise-adjusted stats) "
+            "grouped by eval_name/filter_name/stat/threshold."
+        )
     )
     parser.add_argument(
         "--input",
