@@ -1,3 +1,5 @@
+"""Configuration loading and parsing for biostat_cli."""
+
 from __future__ import annotations
 
 import json
@@ -9,6 +11,21 @@ from typing import Any
 DEFAULT_THRESHOLDS = [0.90, 0.95, 0.98, 0.99]
 ALL_STATS = {"auc", "auprc", "enrichment", "rate_ratio", "pairwise_enrichment", "pairwise_rate_ratio"}
 PAIRWISE_STATS = {"pairwise_enrichment", "pairwise_rate_ratio"}
+
+__all__ = [
+    "DEFAULT_THRESHOLDS",
+    "ALL_STATS",
+    "PAIRWISE_STATS",
+    "TableConfig",
+    "PairwiseColumns",
+    "load_resources",
+    "get_table_config",
+    "parse_csv_arg",
+    "parse_thresholds",
+    "parse_stats",
+    "parse_eval_totals",
+    "detect_pairwise_columns",
+]
 
 
 @dataclass(frozen=True)
@@ -24,6 +41,7 @@ class TableConfig:
 
 
 def load_resources(resources_json: str) -> dict[str, Any]:
+    """Load resources configuration from JSON file."""
     with Path(resources_json).open("r", encoding="utf-8") as handle:
         return json.load(handle)
 

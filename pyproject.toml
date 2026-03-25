@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "biostat-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "Memory-efficient genomic statistics CLI using Polars Lazy API"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,7 +22,7 @@ dev = ["pytest>=8.0.0"]
 
 [project.scripts]
 biostat-cli = "biostat_cli.cli:main"
-figure1-pipeline = "biostat_cli.figure1_pipeline:main"
+figure1-pipeline = "biostat_cli.pipeline:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
